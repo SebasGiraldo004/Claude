@@ -19,10 +19,11 @@
  *   h     buscar home con el sensor (solo si USAR_SENSOR_HOME = 1)
  *   ?     mostrar estado
  *
- * Requiere la libreria AccelStepper (Gestor de librerias del IDE).
+ * La libreria AccelStepper 1.64 (GPL v3, Mike McCauley) viene incluida en
+ * src/AccelStepper: no hace falta instalar nada en el IDE.
  */
 
-#include <AccelStepper.h>
+#include "src/AccelStepper/AccelStepper.h"  // libreria incluida en la carpeta del sketch
 #include <EEPROM.h>
 
 // ---------------- Configuracion ----------------
