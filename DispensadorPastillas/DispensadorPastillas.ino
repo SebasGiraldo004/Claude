@@ -10,13 +10,13 @@
 //      - Contenedor 1 a la izquierda del reposo ... Contenedor 7 a la derecha
 //
 //  PASOS A SEGUIR
-//    1. Configuracion MICROPROCESADOR ESP32          <-- ESTAMOS AQUI
+//    1. Configuracion MICROPROCESADOR ESP32          (listo)
 //         GENERACION DE VARIABLES + CONFIGURACION DE PUERTOS + INTERRUPCIONES
-//    2. Creacion de funciones
+//    2. Creacion de funciones                        (listo)
 //         CARGA - DESCARGA - MOVIMIENTO DE CONTENEDORES
-//    3. Creacion de main
+//    3. Creacion de main                             <-- SIGUIENTE
 //
-//  Requiere: Arduino IDE + paquete "esp32" de Espressif version 3.x
+//  Requiere: Arduino IDE + paquete "esp32" de Espressif (version 2.x o 3.x)
 // =====================================================================
 
 
@@ -136,9 +136,18 @@ void configurarPuertos() {
 }
 
 void configurarInterrupciones() {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  // Paquete esp32 version 3.x
   timerMotor = timerBegin(FRECUENCIA_TIMER_HZ);           // timer a 1 MHz
   timerAttachInterrupt(timerMotor, &isrTimerMotor);       // asocia la ISR
   timerAlarm(timerMotor, PERIODO_MEDIO_PASO_US, true, 0); // repetitiva
+#else
+  // Paquete esp32 version 2.x (reloj APB de 80 MHz / 80 = 1 MHz)
+  timerMotor = timerBegin(0, 80, true);
+  timerAttachInterrupt(timerMotor, &isrTimerMotor, true);
+  timerAlarmWrite(timerMotor, PERIODO_MEDIO_PASO_US, true);
+  timerAlarmEnable(timerMotor);
+#endif
 }
 
 void setup() {
@@ -160,8 +169,144 @@ void setup() {
 
 
 // =====================================================================
-//  2. FUNCIONES  (CARGA - DESCARGA - MOVIMIENTO)  -> siguiente paso
+//  2. FUNCIONES
 // =====================================================================
+//  Convencion de posiciones (en divisiones, sentido horario positivo):
+//      0 = Zona de reposo, 1 = Contenedor 1, ..., 7 = Contenedor 7
+//  "Mover a la division N" significa dejar esa division SOBRE la descarga.
+//  Si el contenedor que llega no es el correcto (llega el 7 en vez del 1),
+//  intercambiar SENTIDO_HORARIO y SENTIDO_ANTIHORARIO en la seccion 1.2.
+
+
+// ---------------------------------------------------------------------
+//  2.1  MOVIMIENTO
+// ---------------------------------------------------------------------
+
+// Lee la posicion actual de forma segura (la ISR tambien la modifica)
+long leerPosicionActual() {
+  portENTER_CRITICAL(&muxMotor);
+  long pos = posicionActual;
+  portEXIT_CRITICAL(&muxMotor);
+  return pos;
+}
+
+// Inicia un movimiento de 'pasos' micropasos. Signo + horario, - antihorario.
+// No bloquea: la ISR del timer genera los pulsos.
+void iniciarMovimiento(long pasos) {
+  if (pasos == 0) return;
+
+  int dir = (pasos > 0) ? 1 : -1;
+  digitalWrite(PIN_DIR, (dir > 0) ? SENTIDO_HORARIO : SENTIDO_ANTIHORARIO);
+  delayMicroseconds(5);  // DRV8825: DIR debe estar estable antes de STEP
+
+  portENTER_CRITICAL(&muxMotor);
+  direccionActual     = dir;
+  nivelPinStep        = false;
+  micropasosRestantes = (pasos > 0) ? pasos : -pasos;
+  motorEnMovimiento   = true;
+  portEXIT_CRITICAL(&muxMotor);
+}
+
+// Espera (bloqueando) a que termine el movimiento en curso
+void esperarFinMovimiento() {
+  while (motorEnMovimiento) {
+    delay(1);
+  }
+  // Mantiene la posicion dentro de una vuelta: 0 .. MICROPASOS_POR_VUELTA-1
+  portENTER_CRITICAL(&muxMotor);
+  posicionActual = ((posicionActual % MICROPASOS_POR_VUELTA) + MICROPASOS_POR_VUELTA)
+                   % MICROPASOS_POR_VUELTA;
+  portEXIT_CRITICAL(&muxMotor);
+}
+
+// Lleva la division indicada (0..7) sobre la descarga por el camino mas corto
+void moverADivision(int division) {
+  long objetivo = (long)division * MICROPASOS_POR_DIVISION;
+  long delta    = objetivo - leerPosicionActual();
+
+  // Camino mas corto: delta queda entre -media vuelta y +media vuelta
+  delta %= MICROPASOS_POR_VUELTA;
+  if (delta >  MICROPASOS_POR_VUELTA / 2) delta -= MICROPASOS_POR_VUELTA;
+  if (delta < -MICROPASOS_POR_VUELTA / 2) delta += MICROPASOS_POR_VUELTA;
+
+  iniciarMovimiento(delta);
+  esperarFinMovimiento();
+}
+
+// Lleva el contenedor N (1..7) sobre la descarga
+bool moverAContenedor(int contenedor) {
+  if (contenedor < 1 || contenedor > NUM_CONTENEDORES) {
+    Serial.printf("Error: contenedor %d no existe (1..%d)\n", contenedor, NUM_CONTENEDORES);
+    return false;
+  }
+  Serial.printf("Moviendo contenedor %d a la descarga...\n", contenedor);
+  moverADivision(contenedor);
+  return true;
+}
+
+// Regresa la zona de reposo sobre la descarga (estado inicial)
+void volverAReposo() {
+  Serial.println("Volviendo a ZONA DE REPOSO...");
+  moverADivision(POSICION_REPOSO);
+  Serial.println("En reposo.");
+}
+
+// Sin sensor de home: declara la posicion actual como zona de reposo.
+// Usar despues de alinear el cilindro a mano.
+void definirReposoAqui() {
+  portENTER_CRITICAL(&muxMotor);
+  posicionActual = (long)POSICION_REPOSO * MICROPASOS_POR_DIVISION;
+  portEXIT_CRITICAL(&muxMotor);
+  Serial.println("Posicion actual definida como ZONA DE REPOSO.");
+}
+
+
+// ---------------------------------------------------------------------
+//  2.2  DESCARGA
+// ---------------------------------------------------------------------
+
+// Lleva un contenedor a la descarga y espera TIEMPO_DESCARGA_MS.
+// No regresa al reposo (asi se pueden encadenar varios contenedores).
+void descargarContenedor(int contenedor) {
+  if (!moverAContenedor(contenedor)) return;
+  Serial.printf("Descargando contenedor %d (%lu ms)...\n", contenedor, TIEMPO_DESCARGA_MS);
+  delay(TIEMPO_DESCARGA_MS);
+  Serial.printf("Contenedor %d descargado.\n", contenedor);
+}
+
+
+// ---------------------------------------------------------------------
+//  2.3  CARGA  (cola de pedidos)
+// ---------------------------------------------------------------------
+
+// Agrega un contenedor a la cola del pedido
+bool cargarEnCola(int contenedor) {
+  if (contenedor < 1 || contenedor > NUM_CONTENEDORES) {
+    Serial.printf("Ignorado: contenedor %d no existe (1..%d)\n", contenedor, NUM_CONTENEDORES);
+    return false;
+  }
+  if (cantidadEnCola >= TAMANO_COLA) {
+    Serial.println("Error: la cola de pedidos esta llena.");
+    return false;
+  }
+  colaContenedores[cantidadEnCola++] = contenedor;
+  return true;
+}
+
+// Descarga todos los contenedores de la cola en orden y vuelve al reposo
+void ejecutarCola() {
+  if (cantidadEnCola == 0) {
+    Serial.println("No hay contenedores en la cola.");
+    return;
+  }
+  Serial.printf("Ejecutando pedido de %d contenedor(es)\n", cantidadEnCola);
+  for (int i = 0; i < cantidadEnCola; i++) {
+    descargarContenedor(colaContenedores[i]);
+  }
+  cantidadEnCola = 0;
+  volverAReposo();
+  Serial.println("Pedido terminado.");
+}
 
 
 // =====================================================================
