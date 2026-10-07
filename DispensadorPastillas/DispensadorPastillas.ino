@@ -14,7 +14,7 @@
 //         GENERACION DE VARIABLES + CONFIGURACION DE PUERTOS + INTERRUPCIONES
 //    2. Creacion de funciones                        (listo)
 //         CARGA - DESCARGA - MOVIMIENTO DE CONTENEDORES
-//    3. Creacion de main                             <-- SIGUIENTE
+//    3. Creacion de main                             (listo)
 //
 //  Requiere: Arduino IDE + paquete "esp32" de Espressif (version 2.x o 3.x)
 // =====================================================================
@@ -150,6 +150,8 @@ void configurarInterrupciones() {
 #endif
 }
 
+void mostrarAyuda();  // definida en la seccion 3
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -165,6 +167,7 @@ void setup() {
   Serial.printf("Micropasos por vuelta   : %ld\n", MICROPASOS_POR_VUELTA);
   Serial.printf("Micropasos por division : %ld\n", MICROPASOS_POR_DIVISION);
   Serial.println("Configuracion lista. Posicion inicial = ZONA DE REPOSO");
+  mostrarAyuda();
 }
 
 
@@ -310,7 +313,82 @@ void ejecutarCola() {
 
 
 // =====================================================================
-//  3. MAIN  -> siguiente paso
+//  3. MAIN
 // =====================================================================
+//  Ordenes por el Monitor Serie (115200 baudios, final de linea "Nueva linea"):
+//      2,5,7   -> descarga los contenedores 2, 5 y 7 y vuelve al reposo
+//      3       -> descarga solo el contenedor 3 y vuelve al reposo
+//      0       -> vuelve a la zona de reposo
+//      + / -   -> ajuste fino (1/8 de division) para alinear a mano
+//      R       -> define la posicion actual como zona de reposo
+//      ?       -> ayuda y posicion actual
+
+const long MICROPASOS_AJUSTE = MICROPASOS_POR_DIVISION / 8;  // 50 micropasos
+
+String lineaSerial = "";
+
+void mostrarAyuda() {
+  Serial.println();
+  Serial.println("----------- ORDENES -----------");
+  Serial.println("  2,5,7  descargar varios contenedores");
+  Serial.println("  3      descargar un contenedor");
+  Serial.println("  0      volver a zona de reposo");
+  Serial.println("  + / -  ajuste fino para alinear");
+  Serial.println("  R      fijar posicion actual como reposo");
+  Serial.println("  ?      ayuda");
+  Serial.printf("Posicion actual: %ld micropasos (division %.2f)\n",
+                leerPosicionActual(),
+                (float)leerPosicionActual() / MICROPASOS_POR_DIVISION);
+  Serial.println("-------------------------------");
+}
+
+// Interpreta una linea completa recibida por serial
+void procesarOrden(String orden) {
+  orden.trim();
+  if (orden.length() == 0) return;
+
+  char c = toupper(orden.charAt(0));
+
+  if (c == '?') { mostrarAyuda();       return; }
+  if (c == 'R') { definirReposoAqui();  return; }
+  if (c == '+') { iniciarMovimiento( MICROPASOS_AJUSTE); esperarFinMovimiento(); return; }
+  if (c == '-') { iniciarMovimiento(-MICROPASOS_AJUSTE); esperarFinMovimiento(); return; }
+  if (orden == "0") { volverAReposo();  return; }
+
+  // Lista de contenedores separados por coma o espacio: "2,5,7" / "2 5 7"
+  cantidadEnCola = 0;
+  int numero = 0;
+  bool hayNumero = false;
+  for (unsigned int i = 0; i <= orden.length(); i++) {
+    char ch = (i < orden.length()) ? orden.charAt(i) : ',';
+    if (isDigit(ch)) {
+      numero = numero * 10 + (ch - '0');
+      hayNumero = true;
+    } else if (ch == ',' || ch == ' ' || ch == ';') {
+      if (hayNumero) cargarEnCola(numero);
+      numero = 0;
+      hayNumero = false;
+    } else {
+      Serial.printf("Orden no valida: \"%s\". Escriba ? para ayuda.\n", orden.c_str());
+      cantidadEnCola = 0;
+      return;
+    }
+  }
+  ejecutarCola();
+}
+
 void loop() {
+  // Lee caracteres hasta completar una linea (Enter)
+  while (Serial.available()) {
+    char ch = Serial.read();
+    if (ch == '\n' || ch == '\r') {
+      if (lineaSerial.length() > 0) {
+        Serial.printf("> %s\n", lineaSerial.c_str());
+        procesarOrden(lineaSerial);
+        lineaSerial = "";
+      }
+    } else if (lineaSerial.length() < 64) {
+      lineaSerial += ch;
+    }
+  }
 }
